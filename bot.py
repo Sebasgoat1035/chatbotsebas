@@ -1,237 +1,267 @@
+import asyncio
 import os
-import random
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+import tempfile
+from pathlib import Path
+from threading import Lock
 
-from predict import analizar_texto
+from google import genai
+from google.genai import types # type: ignore
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
-# ─── Configuración ──────────────────────────────────────
+try:
+    from faster_whisper import WhisperModel
+except ImportError:
+    WhisperModel = None
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-if not TOKEN:
-    print("❌ ERROR: Variable TELEGRAM_TOKEN no configurada")
-    print("📌 Configuración:")
-    print("   En PowerShell: $env:TELEGRAM_TOKEN='tu_token_aqui'")
-    exit(1)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = "gemini-3.5-flash-lite"
+GEMINI_FALLBACK_MODEL = "gemini-3.8-flash"
+HISTORY_LIMIT = 10
+CONTEXT_TURNS = 6
 
-# ─── Datos ──────────────────────────────────────────────
+whisper_model = None
+whisper_lock = Lock()
 
-# INTERPRETACIONES: Qué significa el mensaje que te enviaron
-INTERPRETACIONES = {
-    "reclamo": [
-        "📢 La persona se siente ignorada y reclama tu atención.",
-        "😤 Hay frustración porque esperaba una respuesta y no llegó.",
-        "💢 Percibe que la estás descuidando o ignorando.",
-    ],
-    "celos": [
-        "😒 Siente inseguridad y teme que haya un tercero.",
-        "🔍 Necesita confirmar que sigue siendo importante para ti.",
-        "🤨 Desconfía de tus acciones o amistades.",
-    ],
-    "agresion": [
-        "⚠️ Está muy enojado y busca herir o provocar.",
-        "🔥 El conflicto puede escalar si respondes de forma similar.",
-        "💥 Hay agresividad que debes manejar con cuidado.",
-    ],
-    "tristeza": [
-        "😢 Está pasando por un momento difícil o de dolor.",
-        "🫂 Necesita apoyo emocional y contención.",
-        "💔 Hay vulnerabilidad, no lo ignores.",
-    ],
-    "manipulacion": [
-        "🎭 Está usando culpa o condiciones para obtener lo que quiere.",
-        "⛓️ Quiere presionarte emocionalmente para que actúes.",
-        "⚠️ Ten cuidado con responder desde la culpa.",
-    ],
-    "control": [
-        "🔒 Quiere saber todo lo que haces y con quién.",
-        "👁️ Hay una necesidad excesiva de controlarte.",
-        "📱 No confía plenamente en ti.",
-    ],
-    "ruptura": [
-        "💔 Está considerando seriamente terminar la relación.",
-        "😩 Hay agotamiento emocional acumulado.",
-        "🚪 Quiere distancia o poner un punto final.",
-    ],
-    "desinteres": [
-        "😐 No muestra interés en seguir la conversación.",
-        "❄️ Hay distancia emocional o está ocupado.",
-        "📉 Probablemente no quiere profundizar.",
-    ],
-    "inseguridad": [
-        "😟 Tiene dudas sobre la relación o sobre sí mismo.",
-        "🤔 Necesita reafirmación y seguridad.",
-        "🌀 Busca calmar su ansiedad con respuestas claras.",
-    ],
-    "afecto": [
-        "💕 Está expresando cariño y buenos sentimientos.",
-        "🤗 Quiere acercarse y fortalecer el vínculo.",
-        "🌸 Hay conexión emocional positiva.",
-    ],
-    "curiosidad": [
-        "🤔 Tiene interés genuino en ti y tu vida.",
-        "💬 Quiere iniciar o mantener una conversación.",
-        "🔍 Busca conocer más sobre ti.",
-    ],
-    "normal": [
-        "💬 Es una conversación cotidiana sin carga emocional.",
-        "✅ No hay señales de conflicto ni urgencia.",
-        "📝 Todo fluye con normalidad.",
-    ],
-}
 
-# SUGERENCIAS: Cómo responder al mensaje (para TI)
-SUGERENCIAS = {
-    "reclamo": [
-        "🗣️ Responde: 'Entiendo que te sientes ignorado, no fue mi intención. Hablemos.'",
-        "⏸️ Reconoce su molestia antes de dar explicaciones: 'Tienes razón, no respondí rápido.'",
-        "🤝 Pregunta: '¿Qué puedo hacer para que no te sientas así?'",
-    ],
-    "celos": [
-        "🧠 Responde con calma: 'No hay nadie más, pero entiendo tu inseguridad.'",
-        "💬 Valida su emoción: 'Veo que esto te preocupa, hablemos sin pelear.'",
-        "🔐 Reafirma: 'Eres importante para mí. ¿Podemos hablar de esto tranquilos?'",
-    ],
-    "agresion": [
-        "🌬️ No respondas con agresión. Di: 'Esto se está poniendo feo, hablemos más tarde.'",
-        "🚫 Establece límite: 'No voy a responder si me hablas así.'",
-        "⏰ Tómate un tiempo: 'Mejor hablamos cuando estemos más calmados.'",
-    ],
-    "tristeza": [
-        "👥 Responde: 'Estoy aquí para ti. ¿Quieres hablar de lo que pasa?'",
-        "💬 Muestra apoyo: 'Lamento que te sientas así, cuentas conmigo.'",
-        "🤗 Ofrece compañía: '¿Necesitas desahogarte o prefieres distraerte?'",
-    ],
-    "manipulacion": [
-        "🚩 No cedas por culpa. Di: 'No me gusta que me condiciones así.'",
-        "🗣️ Marca límite: 'Si me quieres pedir algo, hazlo sin chantajes.'",
-        "⚖️ Responde neutro: 'Te escucho, pero no voy a reaccionar desde la culpa.'",
-    ],
-    "control": [
-        "🤝 Responde: 'Confío en ti y espero que tú confíes en mí.'",
-        "📱 Marca espacio: 'Está bien que quieras saber, pero también necesito mi espacio.'",
-        "🧘 Tranquiliza: 'No pasa nada, pero no puedo responder todo el tiempo.'",
-    ],
-    "ruptura": [
-        "💬 Responde: 'Hablemos esto en persona, es importante.'",
-        "🤔 Pide tiempo: 'No tomemos decisiones en caliente. Hablemos mañana.'",
-        "🕊️ Si es firme: 'Lo respeto si es tu decisión, pero me duele.'",
-    ],
-    "desinteres": [
-        "🧐 Pregunta: '¿Estás bien? Parece que no tienes ganas de hablar.'",
-        "💬 Dale espacio: 'Cuando quieras hablar, aquí estoy.'",
-        "⏸️ No insistas: 'Ok, hablamos cuando tengas tiempo.'",
-    ],
-    "inseguridad": [
-        "🔍 Responde: 'Estoy contigo, no tienes nada que temer.'",
-        "💬 Tranquiliza: 'Si algo te preocupa, pregúntame sin miedo.'",
-        "📖 Reafirma: 'Me importas y no tengo nada que ocultar.'",
-    ],
-    "afecto": [
-        "🌸 Corresponde: 'Yo también te quiero mucho ❤️'",
-        "💌 Agradece: 'Qué bonito mensaje, gracias por tus palabras.'",
-        "🎁 Sorprende: 'Me hiciste el día, te quiero igual.'",
-    ],
-    "curiosidad": [
-        "🔍 Responde con entusiasmo: 'Todo bien, ¿y tú? Cuéntame.'",
-        "💬 Aprovecha: 'Justo pensaba en ti. ¿Qué has hecho?'",
-        "🌟 Sigue la conversación: 'Me alegra que preguntes, te cuento...'",
-    ],
-    "normal": [
-        "👍 Responde con naturalidad: 'Todo bien, ¿y tú?'",
-        "💬 Sigue la conversación: 'Qué bueno, seguimos hablando.'",
-        "🌟 Mantén el tono: 'Genial, cualquier cosa me dices.'",
-    ],
-}
-
-EMOJIS = {
-    "reclamo": "😔",
-    "celos": "😒",
-    "agresion": "⚠️",
-    "tristeza": "😢",
-    "manipulacion": "🚩",
-    "control": "🔒",
-    "ruptura": "💔",
-    "desinteres": "😶",
-    "inseguridad": "😟",
-    "afecto": "💕",
-    "curiosidad": "🤔",
-    "normal": "💬",
-}
-
-EMOJIS_EMOCION = {
-    "positivo": "😊",
-    "tristeza": "😢",
-    "enojo": "😠",
-    "sorpresa": "😲",
-    "disgusto": "😖",
-    "miedo": "😨",
-    "neutral": "😐",
-}
-
-# ─── Funciones auxiliares ───────────────────────────────
-
-def construir_barra(valor: int) -> str:
-    bloques = valor // 10
-    return "█" * bloques + "░" * (10 - bloques)
-
-def obtener_texto(diccionario, clave, default="normal"):
-    return random.choice(diccionario.get(clave, diccionario[default]))
-
-def formatear_respuesta(datos: dict) -> str:
-    return (
-        f"{datos['emoji_principal']} *Análisis del mensaje que te enviaron*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{datos['emoji_emocion']} *Emoción detectada:* {datos['emocion']}\n"
-        f"🚩 *Toxicidad:* {datos['toxicidad']}\n"
-        f"🧠 *Intención:* {datos['intencion']}\n"
-        f"💔 *Ghosting:* {datos['ghosting_bar']} {datos['ghosting']}%\n"
-        f"🔥 *Riesgo:* {datos['riesgo']}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💡 *Qué significa:*\n{datos['interpretacion']}\n\n"
-        f"💬 *Cómo responder:*\n{datos['sugerencia']}"
+def crear_cliente_ia():
+    if not GEMINI_API_KEY:
+        raise RuntimeError("Falta configurar GEMINI_API_KEY en PowerShell.")
+    return genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=types.HttpOptions(timeout=45_000),
     )
 
-# ─── Handler principal ──────────────────────────────────
 
-async def responder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def transcribir_audio(ruta_audio: str) -> str:
+    """Transcribe una nota de voz en español usando Whisper local."""
+    global whisper_model
+
+    if WhisperModel is None:
+        raise RuntimeError("Falta faster-whisper. Ejecuta: python -m pip install -r requirements.txt")
+
+    if whisper_model is None:
+        with whisper_lock:
+            if whisper_model is None:
+                # Base ofrece una carga más ligera que small en CPU.
+                whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+
+    segmentos, _ = whisper_model.transcribe(ruta_audio, language="es", vad_filter=True)
+    return " ".join(segmento.text.strip() for segmento in segmentos).strip()
+
+
+def generar_respuesta(pregunta: str, conversacion: list[dict]) -> str:
+    """Genera una respuesta conversacional en español con Gemini."""
+    cliente = crear_cliente_ia()
+    instrucciones = (
+        "Eres ChatMind IA, un asistente conversacional útil, amable y claro. "
+        "Responde en español y contesta directamente la pregunta del usuario. "
+        "Si hace falta información para responder, pide una aclaración. "
+        "No inventes datos; reconoce cuando no sabes algo. Mantén la respuesta breve, "
+        "a menos que el usuario pida una explicación detallada."
+    )
+    contexto = []
+    for turno in conversacion[-CONTEXT_TURNS:]:
+        contexto.append(f"Usuario: {turno['pregunta']}")
+        contexto.append(f"ChatMind IA: {turno['respuesta']}")
+
+    prompt = instrucciones
+    if contexto:
+        prompt += "\n\nConversación reciente:\n" + "\n".join(contexto)
+    prompt += f"\n\nPregunta actual del usuario: {pregunta}"
+
+    configuracion = types.GenerateContentConfig(
+        thinking_config=types.ThinkingConfig(thinking_level="low"),
+        max_output_tokens=500,
+    )
+
+    resultado = None
+    for modelo in (GEMINI_MODEL, GEMINI_FALLBACK_MODEL):
+        try:
+            resultado = cliente.models.generate_content(
+                model=modelo,
+                contents=prompt,
+                config=configuracion,
+            )
+            break
+        except Exception as error:
+            mensaje_error = str(error).upper()
+            es_saturacion = "503" in mensaje_error or "UNAVAILABLE" in mensaje_error
+            if not es_saturacion or modelo == GEMINI_FALLBACK_MODEL:
+                raise
+            print(f"{modelo} está ocupado; probando el modelo alternativo...")
+
+    if resultado is None:
+        return "No pude generar una respuesta en este momento. Intenta de nuevo en unos segundos."
+    respuesta = (resultado.text or "").strip()
+    return respuesta or "No pude generar una respuesta. ¿Puedes formular la pregunta de otra manera?"
+
+
+def guardar_interaccion(context: ContextTypes.DEFAULT_TYPE, pregunta: str, respuesta: str):
+    historial = context.user_data.setdefault("historial_chatmind", [])
+    historial.append({"pregunta": pregunta[:500], "respuesta": respuesta[:1500]})
+    del historial[:-HISTORY_LIMIT]
+
+
+async def responder_pregunta(update: Update, context: ContextTypes.DEFAULT_TYPE, pregunta: str):
+    mensaje = update.effective_message
+    pregunta = pregunta.strip()
+    if not pregunta:
+        await mensaje.reply_text("No alcancé a reconocer una pregunta. Intenta escribirla o grabarla otra vez.")
+        return
+
+    progreso = await mensaje.reply_text("Estoy pensando en una respuesta…")
+    conversacion = context.user_data.setdefault("conversacion_chatmind", [])
     try:
-        texto = update.message.text
-        
-        emocion, toxicidad, ghosting, riesgo, intencion, confianza = analizar_texto(texto)
-        
-        datos = {
-            "emoji_principal": EMOJIS.get(intencion, "💬"),
-            "emoji_emocion": EMOJIS_EMOCION.get(emocion, "😐"),
-            "emocion": emocion.capitalize(),
-            "toxicidad": "🔴 Alta" if toxicidad == "si" else "🟢 Baja",
-            "intencion": intencion.capitalize(),
-            "ghosting": ghosting,
-            "ghosting_bar": construir_barra(ghosting),
-            "riesgo": riesgo,
-            "interpretacion": obtener_texto(INTERPRETACIONES, intencion),
-            "sugerencia": obtener_texto(SUGERENCIAS, intencion),
-        }
-        
-        respuesta = formatear_respuesta(datos)
-        await update.message.reply_text(respuesta, parse_mode="Markdown")
-        
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        await update.message.reply_text("⚠️ Ocurrió un error al procesar el mensaje.")
+        print("Generando respuesta con Gemini...")
+        respuesta = await asyncio.to_thread(generar_respuesta, pregunta, conversacion)
+        conversacion.append({"pregunta": pregunta[:500], "respuesta": respuesta[:1500]})
+        del conversacion[:-CONTEXT_TURNS]
+        guardar_interaccion(context, pregunta, respuesta)
+        await progreso.edit_text(respuesta[:4000])
+        print("Respuesta enviada.")
+    except Exception as error:
+        print(f"Error al generar respuesta: {error}")
+        await progreso.edit_text(
+            "No pude obtener una respuesta de la IA. Revisa la conexión y la configuración de la clave de Gemini."
+        )
 
-# ─── Inicialización ─────────────────────────────────────
+
+async def responder_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await responder_pregunta(update, context, update.effective_message.text or "")
+
+
+async def responder_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mensaje = update.effective_message
+    archivo_temporal = None
+    try:
+        await mensaje.reply_text("Recibí tu audio. Estoy transcribiendo la pregunta…")
+        archivo_telegram = await (mensaje.voice or mensaje.audio).get_file()
+        extension = ".ogg" if mensaje.voice else ".mp3"
+        with tempfile.NamedTemporaryFile(suffix=extension, delete=False) as temporal:
+            archivo_temporal = temporal.name
+
+        await archivo_telegram.download_to_drive(custom_path=archivo_temporal)
+        pregunta = await asyncio.to_thread(transcribir_audio, archivo_temporal)
+        if not pregunta:
+            await mensaje.reply_text("No reconocí palabras en el audio. Intenta grabarlo más cerca y con menos ruido.")
+            return
+
+        await mensaje.reply_text(f"Transcripción: {pregunta}")
+        await responder_pregunta(update, context, pregunta)
+    except Exception as error:
+        print(f"Error al procesar audio: {error}")
+        # Si la conexión con Telegram falló, puede fallar también este aviso.
+        # Evitamos que el error termine como una excepción sin controlar.
+        try:
+            await mensaje.reply_text(
+                "No pude procesar el audio por un problema de conexión con Telegram. "
+                "Espera unos segundos y vuelve a enviarlo."
+            )
+        except Exception as error_aviso:
+            print(f"No se pudo enviar el aviso del audio: {error_aviso}")
+    finally:
+        if archivo_temporal and os.path.exists(archivo_temporal):
+            Path(archivo_temporal).unlink(missing_ok=True)
+
+
+async def mostrar_historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mensaje = update.effective_message
+    historial = context.user_data.get("historial_chatmind", [])
+    if not historial:
+        await mensaje.reply_text("Aún no tienes preguntas guardadas. Envíame una pregunta por texto o audio.")
+        return
+
+    lineas = ["Historial reciente de preguntas y respuestas:"]
+    for numero, turno in enumerate(reversed(historial[-5:]), start=1):
+        pregunta = turno["pregunta"].replace("\n", " ")[:180]
+        respuesta = turno["respuesta"].replace("\n", " ")[:280]
+        lineas.append(f"\n{numero}. Tú: {pregunta}\nChatMind IA: {respuesta}")
+    await mensaje.reply_text("\n".join(lineas)[:4000])
+
+
+async def nueva_conversacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["conversacion_chatmind"] = []
+    await update.effective_message.reply_text(
+        "Listo. Empezamos una conversación nueva. El historial anterior sigue disponible con /historial."
+    )
+
+
+def teclado_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Hacer una pregunta", callback_data="preguntar")],
+        [InlineKeyboardButton("Ver historial", callback_data="historial")],
+        [InlineKeyboardButton("Nueva conversación", callback_data="nueva")],
+        [InlineKeyboardButton("Cómo funciona", callback_data="ayuda")],
+    ])
+
+
+async def mostrar_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "ChatMind IA\n\nPuedes escribirme una pregunta o enviarla como nota de voz.",
+        reply_markup=teclado_menu(),
+    )
+
+
+async def mostrar_ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "Envíame una pregunta por texto o como nota de voz y te responderé. "
+        "El bot conserva los últimos seis intercambios como contexto. "
+        "Usa /historial para consultar los últimos cinco y /nuevo para empezar desde cero."
+    )
+
+
+async def atender_boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    consulta = update.callback_query
+    await consulta.answer()
+    if consulta.data == "preguntar":
+        await consulta.message.reply_text("Escribe tu pregunta o graba una nota de voz.")
+    elif consulta.data == "historial":
+        await mostrar_historial(update, context)
+    elif consulta.data == "nueva":
+        await nueva_conversacion(update, context)
+    elif consulta.data == "ayuda":
+        await mostrar_ayuda(update, context)
+
 
 def main():
-    print("🤖 Bot de análisis de mensajes activo...")
-    print("📌 Analizo los mensajes que TE ENVÍAN y te digo cómo responder")
-    
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder))
-    
-    print("🟢 Bot corriendo... Esperando mensajes")
+    if not TELEGRAM_TOKEN:
+        raise SystemExit("Falta configurar TELEGRAM_TOKEN en PowerShell.")
+    if not GEMINI_API_KEY:
+        raise SystemExit("Falta configurar GEMINI_API_KEY en PowerShell.")
+
+    # La red estaba agotando el timeout predeterminado de 5 segundos al responder
+    # al audio. Damos más margen a las solicitudes normales del Bot API.
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .connect_timeout(30)
+        .read_timeout(60)
+        .write_timeout(60)
+        .pool_timeout(30)
+        .build()
+    )
+    app.add_handler(CommandHandler("start", mostrar_menu))
+    app.add_handler(CommandHandler("menu", mostrar_menu))
+    app.add_handler(CommandHandler("ayuda", mostrar_ayuda))
+    app.add_handler(CommandHandler("historial", mostrar_historial))
+    app.add_handler(CommandHandler("nuevo", nueva_conversacion))
+    app.add_handler(CallbackQueryHandler(atender_boton))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder_texto))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, responder_audio))
+
+    print("ChatMind IA iniciado: preguntas por texto y audio, contexto e historial activos.")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
